@@ -1,28 +1,34 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const twilio = require('twilio');
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Twilio client
+// Initialize Twilio client
 const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// Store conversations
-const conversations = new Map();
+// Initialize Telegram Bot
+const telegramBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
-// ===== WEBHOOK: When customer sends message =====
-app.post('/whatsapp', (req, res) => {
+// Store conversations and mappings
+const conversations = new Map();
+const telegramToWhatsAppMap = new Map(); // Maps Telegram message ID -> WhatsApp number
+
+// ===== 1. FORWARD WHATSAPP MESSAGES TO TELEGRAM =====
+app.post('/whatsapp', async (req, res) => {
   const customerMessage = req.body.Body;
   const customerNumber = req.body.From; // whatsapp:+254712345678
   const messageSid = req.body.MessageSid;
   
-  console.log('\n📨 NEW MESSAGE FROM CUSTOMER:');
+  console.log('\n📨 NEW WHATSAPP MESSAGE:');
   console.log(`From: ${customerNumber}`);
   console.log(`Message: ${customerMessage}`);
   
@@ -30,7 +36,7 @@ app.post('/whatsapp', (req, res) => {
   const cleanPhone = customerNumber.replace('whatsapp:', '');
   const phoneDigits = cleanPhone.replace('+', '');
   
-  // Store message
+  // Store message locally
   if (!conversations.has(phoneDigits)) {
     conversations.set(phoneDigits, []);
   }
@@ -42,36 +48,122 @@ app.post('/whatsapp', (req, res) => {
     messageId: messageSid
   });
   
-  // Auto-reply
+  // Forward to Telegram
+  try {
+    const telegramMessage = await telegramBot.sendMessage(
+      process.env.TELEGRAM_CHAT_ID,
+      `📱 *New WhatsApp Message*\n\n` +
+      `*From:* +${phoneDigits}\n` +
+      `*Message:* ${customerMessage}\n\n` +
+      `_Reply to this message to respond_`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Store mapping: Telegram message ID -> WhatsApp number
+    telegramToWhatsAppMap.set(telegramMessage.message_id, cleanPhone);
+    
+    console.log(`✅ Forwarded to Telegram (Message ID: ${telegramMessage.message_id})`);
+  } catch (error) {
+    console.error('❌ Failed to forward to Telegram:', error.message);
+  }
+  
+  // Send auto-reply to WhatsApp
   const twiml = new twilio.twiml.MessagingResponse();
   
-  // Customize auto-reply based on message
   const lowerMessage = customerMessage.toLowerCase();
-  
   if (lowerMessage.includes('hello') || lowerMessage.includes('hi')) {
-    twiml.message(`Hello! 👋 Welcome to our service. How can I help you?`);
-  } 
-  else if (lowerMessage.includes('price') || lowerMessage.includes('cost')) {
-    twiml.message(`Our pricing starts at $10/month. Interested in more details?`);
-  }
-  else if (lowerMessage.includes('contact') || lowerMessage.includes('support')) {
-    twiml.message(`Contact support: support@example.com or call +254712345678`);
-  }
-  else if (lowerMessage.includes('menu')) {
-    twiml.message(`📋 Menu:\n1. Pricing\n2. Support\n3. Services\n4. About us\n\nReply with number or question.`);
-  }
-  else {
-    twiml.message(`Thanks for your message! An agent will reply soon.`);
+    twiml.message(`Hello! 👋 Our agent will reply shortly via Telegram.`);
+  } else {
+    twiml.message(`Thanks for your message! Our support team has been notified and will reply shortly.`);
   }
   
   res.type('text/xml').send(twiml.toString());
-  
-  // Log to console
-  console.log(`💬 Sent auto-reply to: ${cleanPhone}`);
 });
 
-// ===== SEND MESSAGE TO CUSTOMER =====
+// ===== 2. LISTEN FOR TELEGRAM REPLIES =====
+telegramBot.on('message', async (msg) => {
+  // Check if this is a reply to a forwarded WhatsApp message
+  if (msg.reply_to_message) {
+    const originalMessageId = msg.reply_to_message.message_id;
+    const whatsappNumber = telegramToWhatsAppMap.get(originalMessageId);
+    
+    if (whatsappNumber && msg.text) {
+      console.log(`\n📨 TELEGRAM REPLY DETECTED:`);
+      console.log(`To WhatsApp: +${whatsappNumber}`);
+      console.log(`Message: ${msg.text}`);
+      
+      try {
+        // Send reply via Twilio WhatsApp
+        const result = await client.messages.create({
+          body: msg.text,
+          from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
+          to: `whatsapp:+${whatsappNumber}`
+        });
+        
+        // Store in conversations
+        const phoneDigits = whatsappNumber.replace('+', '');
+        if (!conversations.has(phoneDigits)) {
+          conversations.set(phoneDigits, []);
+        }
+        
+        conversations.get(phoneDigits).push({
+          type: 'agent',
+          message: msg.text,
+          time: new Date(),
+          messageId: result.sid,
+          via: 'telegram'
+        });
+        
+        console.log(`✅ Reply sent via WhatsApp (SID: ${result.sid})`);
+        
+        // Confirm in Telegram
+        await telegramBot.sendMessage(
+          msg.chat.id,
+          `✅ Reply sent to +${whatsappNumber}`,
+          { reply_to_message_id: msg.message_id }
+        );
+        
+      } catch (error) {
+        console.error('❌ Failed to send WhatsApp reply:', error);
+        await telegramBot.sendMessage(
+          msg.chat.id,
+          `❌ Failed to send: ${error.message}`
+        );
+      }
+    }
+  }
+  
+  // Handle commands
+  if (msg.text === '/start') {
+    await telegramBot.sendMessage(
+      msg.chat.id,
+      `🤖 *WhatsApp Support Bot*\n\n` +
+      `I forward WhatsApp messages here and let you reply via Telegram.\n\n` +
+      `*How to use:*\n` +
+      `1. Customers message your WhatsApp number\n` +
+      `2. Messages appear here\n` +
+      `3. Reply to any message to respond\n` +
+      `4. Your reply goes back to WhatsApp\n\n` +
+      `Active conversations: ${conversations.size}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+  
+  if (msg.text === '/status') {
+    await telegramBot.sendMessage(
+      msg.chat.id,
+      `📊 *Bot Status*\n\n` +
+      `Active conversations: ${conversations.size}\n` +
+      `WhatsApp number: ${process.env.TWILIO_WHATSAPP_NUMBER}\n` +
+      `Mappings stored: ${telegramToWhatsAppMap.size}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+// ===== 3. KEEP EXISTING API ENDPOINTS =====
 app.post('/send', async (req, res) => {
+  // ... keep your existing send endpoint ...
   try {
     const { to, message } = req.body;
     
@@ -79,10 +171,9 @@ app.post('/send', async (req, res) => {
       return res.status(400).json({ error: 'Missing "to" or "message"' });
     }
     
-    // Format: +254712345678 -> whatsapp:+254712345678
     const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
     
-    console.log(`\n📤 SENDING MESSAGE TO: ${formattedTo}`);
+    console.log(`\n📤 MANUAL SEND TO: ${formattedTo}`);
     console.log(`Message: ${message}`);
     
     const result = await client.messages.create({
@@ -101,7 +192,8 @@ app.post('/send', async (req, res) => {
       type: 'agent',
       message: message,
       time: new Date(),
-      messageId: result.sid
+      messageId: result.sid,
+      via: 'dashboard'
     });
     
     console.log(`✅ Message sent! SID: ${result.sid}`);
@@ -119,7 +211,6 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// ===== GET CONVERSATIONS =====
 app.get('/conversations', (req, res) => {
   const allConversations = {};
   
@@ -133,66 +224,46 @@ app.get('/conversations', (req, res) => {
   });
 });
 
-// ===== WEB INTERFACE =====
+// ===== 4. UPDATED DASHBOARD (VIEW ONLY) =====
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-      <title>WhatsApp Bot Dashboard</title>
+      <title>WhatsApp + Telegram Bot</title>
       <style>
         body { font-family: Arial; padding: 20px; max-width: 800px; margin: 0 auto; }
         h1 { color: #25D366; }
+        .telegram-info { background: #0088cc; color: white; padding: 15px; border-radius: 8px; margin: 20px 0; }
+        .telegram-info a { color: white; text-decoration: underline; }
         .conversation { border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 8px; }
         .customer { background: #f8f9fa; padding: 8px; margin: 5px 0; border-radius: 5px; }
         .agent { background: #e7f3ff; padding: 8px; margin: 5px 0; border-radius: 5px; }
         .customer strong { color: #d63384; }
         .agent strong { color: #0d6efd; }
-        form { background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; }
-        input, textarea { display: block; margin: 10px 0; padding: 10px; width: 100%; max-width: 400px; }
-        button { padding: 10px 20px; background: #25D366; color: white; border: none; border-radius: 5px; cursor: pointer; }
-        button:hover { background: #1da851; }
-        .status { color: #666; font-size: 14px; }
+        .via { font-size: 12px; color: #666; margin-left: 10px; }
       </style>
     </head>
     <body>
-      <h1>📱 WhatsApp Bot Dashboard</h1>
-      <p class="status">Using Twilio Number: ${process.env.TWILIO_WHATSAPP_NUMBER}</p>
+      <h1>📱 WhatsApp + Telegram Bot</h1>
+      <p>Using Twilio Number: ${process.env.TWILIO_WHATSAPP_NUMBER}</p>
       
-      <h2>Send Message</h2>
-      <form id="sendForm">
-        <input type="text" id="to" placeholder="Customer phone (e.g., +254712345678)" required>
-        <textarea id="message" placeholder="Your message..." rows="3" required></textarea>
-        <button type="submit">📤 Send WhatsApp Message</button>
-      </form>
+      <div class="telegram-info">
+        <h3>🤖 Telegram Integration Active</h3>
+        <p><strong>How to reply:</strong></p>
+        <ol>
+          <li>Open Telegram app</li>
+          <li>Go to your bot: <strong>@${process.env.TELEGRAM_BOT_USERNAME || 'YourBot'}</strong></li>
+          <li>Reply to any forwarded message</li>
+          <li>Your reply will be sent to WhatsApp automatically</li>
+        </ol>
+        <p>Commands: /start, /status</p>
+      </div>
       
       <h2>Recent Conversations (<span id="count">0</span>)</h2>
       <div id="conversations">Loading...</div>
       
       <script>
-        // Send message
-        document.getElementById('sendForm').onsubmit = async (e) => {
-          e.preventDefault();
-          const to = document.getElementById('to').value;
-          const message = document.getElementById('message').value;
-          
-          const response = await fetch('/send', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to, message })
-          });
-          
-          const result = await response.json();
-          if (result.success) {
-            alert('✅ Message sent successfully!');
-            document.getElementById('message').value = '';
-            loadConversations();
-          } else {
-            alert('❌ Error: ' + result.error);
-          }
-        };
-        
-        // Load conversations
         async function loadConversations() {
           try {
             const response = await fetch('/conversations');
@@ -217,13 +288,11 @@ app.get('/', (req, res) => {
                   \${messages.map(msg => \`
                     <div class="\${msg.type}">
                       <strong>\${msg.type.toUpperCase()}:</strong> 
-                      \${msg.message}<br>
+                      \${msg.message}
+                      \${msg.via ? '<span class="via">(via ' + msg.via + ')</span>' : ''}<br>
                       <small>\${new Date(msg.time).toLocaleString()}</small>
                     </div>
                   \`).join('')}
-                  <hr>
-                  <input type="text" id="reply-\${phone}" placeholder="Reply to +<span>\${phone}</span>">
-                  <button onclick="sendReply('\${phone}')">Reply</button>
                 </div>
               \`;
             }
@@ -231,32 +300,6 @@ app.get('/', (req, res) => {
             container.innerHTML = html;
           } catch (error) {
             console.error('Error loading conversations:', error);
-          }
-        }
-        
-        // Send reply from conversation view
-        async function sendReply(phone) {
-          const messageInput = document.getElementById('reply-' + phone);
-          const message = messageInput.value.trim();
-          
-          if (!message) {
-            alert('Please enter a message');
-            return;
-          }
-          
-          const response = await fetch('/send', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to: '+' + phone, message })
-          });
-          
-          const result = await response.json();
-          if (result.success) {
-            alert('✅ Reply sent!');
-            messageInput.value = '';
-            loadConversations();
-          } else {
-            alert('❌ Error: ' + result.error);
           }
         }
         
@@ -269,7 +312,7 @@ app.get('/', (req, res) => {
   `);
 });
 
-// ===== START SERVER =====
+// ===== 5. START SERVER =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   const herokuUrl = process.env.HEROKU_APP_NAME 
@@ -277,15 +320,25 @@ app.listen(PORT, () => {
     : `http://localhost:${PORT}`;
   
   console.log(`
-🚀 WhatsApp Bot Server Started!
+🚀 WhatsApp + Telegram Bot Started!
 📞 Twilio Number: ${process.env.TWILIO_WHATSAPP_NUMBER}
+🤖 Telegram Bot: Active
 🌐 Dashboard: ${herokuUrl}
 📨 Webhook: ${herokuUrl}/whatsapp
 
-✅ Test Instructions:
-1. Message the sandbox number from WhatsApp
-2. See messages appear in console
-3. Use dashboard to reply
-4. Customer sees messages from Twilio number (not your number)
+✅ Setup Instructions:
+1. Message your WhatsApp sandbox number
+2. Check Telegram for the forwarded message
+3. Reply in Telegram (to the specific message)
+4. Reply goes back to WhatsApp automatically
+
+📋 Telegram Commands:
+/start - Show help
+/status - Check bot status
   `);
+});
+
+// Handle errors
+telegramBot.on('error', (error) => {
+  console.error('Telegram Bot Error:', error);
 });
