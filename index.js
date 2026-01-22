@@ -272,11 +272,15 @@ app.get('/', (req, res) => {
 // ===== START SERVER =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+  const herokuUrl = process.env.HEROKU_APP_NAME 
+    ? `https://${process.env.HEROKU_APP_NAME}.herokuapp.com`
+    : `http://localhost:${PORT}`;
+  
   console.log(`
 🚀 WhatsApp Bot Server Started!
 📞 Twilio Number: ${process.env.TWILIO_WHATSAPP_NUMBER}
-🌐 Dashboard: http://localhost:${PORT}
-📨 Webhook: http://localhost:${PORT}/whatsapp
+🌐 Dashboard: ${herokuUrl}
+📨 Webhook: ${herokuUrl}/whatsapp
 
 ✅ Test Instructions:
 1. Message the sandbox number from WhatsApp
