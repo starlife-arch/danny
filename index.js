@@ -2,7 +2,6 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const twilio = require('twilio');
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
@@ -19,22 +18,46 @@ const client = twilio(
 const telegramBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
 // Store conversations and mappings
-const conversations = new Map();
-const telegramToWhatsAppMap = new Map(); // Maps Telegram message ID -> WhatsApp number
+const conversations = new Map(); // Stores by phone digits without + (254762725066)
+const telegramToWhatsAppMap = new Map(); // Maps Telegram message ID -> WhatsApp number with + (+254762725066)
+
+// Helper function to format WhatsApp numbers correctly
+function formatWhatsAppNumber(phone) {
+  // Remove any existing whatsapp: prefix
+  phone = phone.replace('whatsapp:', '');
+  
+  // Remove any extra plus signs
+  phone = phone.replace(/\++/g, '');
+  
+  // Ensure it starts with exactly one +
+  if (!phone.startsWith('+')) {
+    phone = '+' + phone;
+  }
+  
+  return `whatsapp:${phone}`;
+}
+
+// Helper function to extract phone digits (without +)
+function extractPhoneDigits(phone) {
+  return phone.replace('whatsapp:', '').replace('+', '');
+}
 
 // ===== 1. FORWARD WHATSAPP MESSAGES TO TELEGRAM =====
 app.post('/whatsapp', async (req, res) => {
   const customerMessage = req.body.Body;
-  const customerNumber = req.body.From; // whatsapp:+254712345678
+  const customerNumber = req.body.From; // whatsapp:+254762725066
   const messageSid = req.body.MessageSid;
   
   console.log('\n📨 NEW WHATSAPP MESSAGE:');
-  console.log(`From: ${customerNumber}`);
+  console.log(`Raw From: ${customerNumber}`);
   console.log(`Message: ${customerMessage}`);
   
-  // Extract clean phone number
-  const cleanPhone = customerNumber.replace('whatsapp:', '');
-  const phoneDigits = cleanPhone.replace('+', '');
+  // Extract phone number without whatsapp: prefix but with +
+  const phoneWithPlus = customerNumber.replace('whatsapp:', ''); // +254762725066
+  const phoneDigits = extractPhoneDigits(customerNumber); // 254762725066
+  
+  console.log(`Phone with +: ${phoneWithPlus}`);
+  console.log(`Phone digits: ${phoneDigits}`);
   
   // Store message locally
   if (!conversations.has(phoneDigits)) {
@@ -53,16 +76,17 @@ app.post('/whatsapp', async (req, res) => {
     const telegramMessage = await telegramBot.sendMessage(
       process.env.TELEGRAM_CHAT_ID,
       `📱 *New WhatsApp Message*\n\n` +
-      `*From:* +${phoneDigits}\n` +
+      `*From:* ${phoneWithPlus}\n` +
       `*Message:* ${customerMessage}\n\n` +
       `_Reply to this message to respond_`,
       { parse_mode: 'Markdown' }
     );
     
-    // Store mapping: Telegram message ID -> WhatsApp number
-    telegramToWhatsAppMap.set(telegramMessage.message_id, cleanPhone);
+    // Store mapping: Telegram message ID -> WhatsApp number (with +)
+    telegramToWhatsAppMap.set(telegramMessage.message_id, phoneWithPlus);
     
     console.log(`✅ Forwarded to Telegram (Message ID: ${telegramMessage.message_id})`);
+    console.log(`Stored mapping: ${telegramMessage.message_id} -> ${phoneWithPlus}`);
   } catch (error) {
     console.error('❌ Failed to forward to Telegram:', error.message);
   }
@@ -89,19 +113,26 @@ telegramBot.on('message', async (msg) => {
     
     if (whatsappNumber && msg.text) {
       console.log(`\n📨 TELEGRAM REPLY DETECTED:`);
-      console.log(`To WhatsApp: +${whatsappNumber}`);
-      console.log(`Message: ${msg.text}`);
+      console.log(`Original Telegram Message ID: ${originalMessageId}`);
+      console.log(`WhatsApp Number from mapping: ${whatsappNumber}`);
+      console.log(`Reply text: ${msg.text}`);
       
       try {
+        // Format the number correctly
+        const formattedNumber = formatWhatsAppNumber(whatsappNumber);
+        console.log(`Formatted for Twilio: ${formattedNumber}`);
+        
         // Send reply via Twilio WhatsApp
         const result = await client.messages.create({
           body: msg.text,
           from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
-          to: `whatsapp:+${whatsappNumber}`
+          to: formattedNumber
         });
         
+        // Extract digits for storage
+        const phoneDigits = extractPhoneDigits(whatsappNumber);
+        
         // Store in conversations
-        const phoneDigits = whatsappNumber.replace('+', '');
         if (!conversations.has(phoneDigits)) {
           conversations.set(phoneDigits, []);
         }
@@ -119,7 +150,7 @@ telegramBot.on('message', async (msg) => {
         // Confirm in Telegram
         await telegramBot.sendMessage(
           msg.chat.id,
-          `✅ Reply sent to +${whatsappNumber}`,
+          `✅ Reply sent to ${whatsappNumber}`,
           { reply_to_message_id: msg.message_id }
         );
         
@@ -130,6 +161,9 @@ telegramBot.on('message', async (msg) => {
           `❌ Failed to send: ${error.message}`
         );
       }
+    } else {
+      console.log(`❌ No mapping found for Telegram message ID: ${originalMessageId}`);
+      console.log(`Available mappings:`, Array.from(telegramToWhatsAppMap.entries()));
     }
   }
   
@@ -159,11 +193,20 @@ telegramBot.on('message', async (msg) => {
       { parse_mode: 'Markdown' }
     );
   }
+  
+  if (msg.text === '/debug') {
+    await telegramBot.sendMessage(
+      msg.chat.id,
+      `🔍 *Debug Info*\n\n` +
+      `Conversations: ${JSON.stringify(Array.from(conversations.entries()).slice(0, 3), null, 2)}\n\n` +
+      `Mappings: ${JSON.stringify(Array.from(telegramToWhatsAppMap.entries()).slice(0, 5), null, 2)}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
 });
 
-// ===== 3. KEEP EXISTING API ENDPOINTS =====
+// ===== 3. SEND MESSAGE VIA API (KEEP EXISTING) =====
 app.post('/send', async (req, res) => {
-  // ... keep your existing send endpoint ...
   try {
     const { to, message } = req.body;
     
@@ -171,7 +214,8 @@ app.post('/send', async (req, res) => {
       return res.status(400).json({ error: 'Missing "to" or "message"' });
     }
     
-    const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+    // Format the number correctly
+    const formattedTo = formatWhatsAppNumber(to);
     
     console.log(`\n📤 MANUAL SEND TO: ${formattedTo}`);
     console.log(`Message: ${message}`);
@@ -182,8 +226,10 @@ app.post('/send', async (req, res) => {
       to: formattedTo
     });
     
+    // Extract digits for storage
+    const phoneDigits = extractPhoneDigits(to);
+    
     // Store sent message
-    const phoneDigits = to.replace('+', '').replace('whatsapp:', '');
     if (!conversations.has(phoneDigits)) {
       conversations.set(phoneDigits, []);
     }
@@ -211,6 +257,7 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// ===== 4. GET CONVERSATIONS =====
 app.get('/conversations', (req, res) => {
   const allConversations = {};
   
@@ -220,11 +267,12 @@ app.get('/conversations', (req, res) => {
   
   res.json({
     total: conversations.size,
-    conversations: allConversations
+    conversations: allConversations,
+    mappings: telegramToWhatsAppMap.size
   });
 });
 
-// ===== 4. UPDATED DASHBOARD (VIEW ONLY) =====
+// ===== 5. WEB INTERFACE =====
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -242,6 +290,13 @@ app.get('/', (req, res) => {
         .customer strong { color: #d63384; }
         .agent strong { color: #0d6efd; }
         .via { font-size: 12px; color: #666; margin-left: 10px; }
+        .debug { background: #f8d7da; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        form { background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        input, textarea { display: block; margin: 10px 0; padding: 10px; width: 100%; max-width: 400px; }
+        button { padding: 10px 20px; background: #25D366; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        button:hover { background: #1da851; }
+        .secondary { background: #6c757d; }
+        .secondary:hover { background: #5a6268; }
       </style>
     </head>
     <body>
@@ -253,12 +308,26 @@ app.get('/', (req, res) => {
         <p><strong>How to reply:</strong></p>
         <ol>
           <li>Open Telegram app</li>
-          <li>Go to your bot: <strong>@${process.env.TELEGRAM_BOT_USERNAME || 'YourBot'}</strong></li>
+          <li>Go to your bot</li>
           <li>Reply to any forwarded message</li>
           <li>Your reply will be sent to WhatsApp automatically</li>
         </ol>
-        <p>Commands: /start, /status</p>
+        <p>Commands: /start, /status, /debug</p>
       </div>
+      
+      <div class="debug">
+        <h3>🔧 Debug Info</h3>
+        <p><strong>Note:</strong> Fixed double-plus sign issue. Now formatting numbers correctly.</p>
+        <p>Expected format: <code>whatsapp:+254762725066</code></p>
+        <p>Wrong format (fixed): <code>whatsapp:++254762725066</code></p>
+      </div>
+      
+      <h2>Send Test Message</h2>
+      <form id="sendForm">
+        <input type="text" id="to" placeholder="Customer phone (e.g., +254712345678)" required>
+        <textarea id="message" placeholder="Your message..." rows="3" required></textarea>
+        <button type="submit">📤 Send WhatsApp Message</button>
+      </form>
       
       <h2>Recent Conversations (<span id="count">0</span>)</h2>
       <div id="conversations">Loading...</div>
@@ -303,6 +372,28 @@ app.get('/', (req, res) => {
           }
         }
         
+        // Send message from form
+        document.getElementById('sendForm').onsubmit = async (e) => {
+          e.preventDefault();
+          const to = document.getElementById('to').value;
+          const message = document.getElementById('message').value;
+          
+          const response = await fetch('/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to, message })
+          });
+          
+          const result = await response.json();
+          if (result.success) {
+            alert('✅ Message sent successfully!');
+            document.getElementById('message').value = '';
+            loadConversations();
+          } else {
+            alert('❌ Error: ' + result.error);
+          }
+        };
+        
         // Auto-refresh every 5 seconds
         loadConversations();
         setInterval(loadConversations, 5000);
@@ -312,7 +403,19 @@ app.get('/', (req, res) => {
   `);
 });
 
-// ===== 5. START SERVER =====
+// ===== 6. HEALTH CHECK =====
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date(),
+    conversations: conversations.size,
+    mappings: telegramToWhatsAppMap.size,
+    telegram: telegramBot.isPolling() ? 'connected' : 'disconnected',
+    twilio: process.env.TWILIO_ACCOUNT_SID ? 'configured' : 'missing'
+  });
+});
+
+// ===== 7. START SERVER =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   const herokuUrl = process.env.HEROKU_APP_NAME 
@@ -325,6 +428,7 @@ app.listen(PORT, () => {
 🤖 Telegram Bot: Active
 🌐 Dashboard: ${herokuUrl}
 📨 Webhook: ${herokuUrl}/whatsapp
+🏥 Health Check: ${herokuUrl}/health
 
 ✅ Setup Instructions:
 1. Message your WhatsApp sandbox number
@@ -335,6 +439,13 @@ app.listen(PORT, () => {
 📋 Telegram Commands:
 /start - Show help
 /status - Check bot status
+/debug - Show debug info
+
+🔄 Phone Number Formatting Fixed:
+- Input: whatsapp:+254762725066
+- Stored as digits: 254762725066
+- Stored in mapping: +254762725066
+- Formatted for Twilio: whatsapp:+254762725066
   `);
 });
 
